@@ -1,0 +1,1296 @@
+From dad767d075abc47e820a73b6c66e1ffcaa2f0176 Mon Sep 17 00:00:00 2001
+From: Heinz Wiesinger <heinz.accounts+anthropic@wiesinger.pro>
+Date: Wed, 21 Oct 2026 21:06:25 +0000
+Subject: [PATCH 1/3] splash: Only scale the visible part of images
+
+Splash::drawImage() used to scale every image to its full size on the
+device and colour convert all of it before blitting, even when only a
+small part of it is visible. When rendering a tile of a zoomed in page,
+or an image that is clipped to a small region, nearly all of that work
+is thrown away, and it grows with the zoom level: a 1920x1080 tile of a
+page with a full page 3508x2480 image at 800 dpi means scaling the image
+to 9355x6613 pixels.
+
+Now drawImage() computes the part of the scaled image that can be
+visible given the clip (including the bounding box of clip paths) and
+the bitmap, and the scaling functions only produce that part. Source
+rows above the visible part are skipped without being converted (image
+sources now accept a nullptr colorLine to skip a line), and source rows
+below it are not read at all.
+
+The output is identical to before: the scaling functions use the same
+arithmetic and just skip storing the pixels outside the crop rectangle.
+
+Rendering a single page with 11 full-page JPEG images, 10 of them clipped
+to small regions, with the Qt6 frontend:
+
+                         before     after
+  full page, 10 dpi       834 ms    353 ms
+  full page, 96 dpi      1372 ms    479 ms
+  full page, 200 dpi     2673 ms    772 ms
+  1920x1080 at 400 dpi  10515 ms    512 ms
+  1920x1080 at 800 dpi  33317 ms    528 ms
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014HMJHMHEm38AikxhNxAjhE
+---
+ poppler/SplashOutputDev.cc |  33 +++
+ splash/Splash.cc           | 503 ++++++++++++++++++++++++++-----------
+ splash/Splash.h            |  27 +-
+ splash/SplashClip.cc       |  31 +++
+ splash/SplashClip.h        |   5 +
+ 5 files changed, 444 insertions(+), 155 deletions(-)
+
+diff --git a/poppler/SplashOutputDev.cc b/poppler/SplashOutputDev.cc
+index 357b3f5..c595027 100644
+--- a/poppler/SplashOutputDev.cc
++++ b/poppler/SplashOutputDev.cc
+@@ -2754,6 +2754,15 @@ bool SplashOutputDev::imageSrc(void *data, SplashColorPtr colorLine, unsigned ch
+     if (imgData->y == imgData->height) {
+         return false;
+     }
++    if (!colorLine) {
++        // skip the line
++        imgData->imgStr->skipLine();
++        if (imgData->maskStr) {
++            imgData->maskStr->skipLine();
++        }
++        ++imgData->y;
++        return true;
++    }
+     if (!(p = imgData->imgStr->getLine())) {
+         int destComps = 1;
+         if (imgData->colorMode == splashModeRGB8 || imgData->colorMode == splashModeBGR8) {
+@@ -2902,6 +2911,12 @@ bool SplashOutputDev::iccImageSrc(void *data, SplashColorPtr colorLine, unsigned
+     if (imgData->y == imgData->height) {
+         return false;
+     }
++    if (!colorLine) {
++        // skip the line
++        imgData->imgStr->skipLine();
++        ++imgData->y;
++        return true;
++    }
+     if (!(p = imgData->imgStr->getLine())) {
+         int destComps = 1;
+         if (imgData->colorMode == splashModeRGB8 || imgData->colorMode == splashModeBGR8) {
+@@ -3004,6 +3019,12 @@ bool SplashOutputDev::alphaImageSrc(void *data, SplashColorPtr colorLine, unsign
+     if (imgData->y == imgData->height) {
+         return false;
+     }
++    if (!colorLine) {
++        // skip the line
++        imgData->imgStr->skipLine();
++        ++imgData->y;
++        return true;
++    }
+     if (!(p = imgData->imgStr->getLine())) {
+         return false;
+     }
+@@ -3116,6 +3137,12 @@ bool SplashOutputDev::tilingBitmapSrc(void *data, SplashColorPtr colorLine, unsi
+         imgData->y = 0;
+     }
+ 
++    if (!colorLine) {
++        // skip the line
++        ++imgData->y;
++        return true;
++    }
++
+     if (imgData->paintType == 1) {
+         const SplashColorMode cMode = imgData->bitmap->getMode();
+         SplashColorPtr q = colorLine;
+@@ -3361,6 +3388,12 @@ bool SplashOutputDev::maskedImageSrc(void *data, SplashColorPtr colorLine, unsig
+     if (imgData->y == imgData->height) {
+         return false;
+     }
++    if (!colorLine) {
++        // skip the line
++        imgData->imgStr->skipLine();
++        ++imgData->y;
++        return true;
++    }
+     if (!(p = imgData->imgStr->getLine())) {
+         return false;
+     }
+diff --git a/splash/Splash.cc b/splash/Splash.cc
+index 3d004b9..14bc0a8 100644
+--- a/splash/Splash.cc
++++ b/splash/Splash.cc
+@@ -38,8 +38,10 @@
+ #include <cstring>
+ #include <climits>
+ #include <cassert>
++#include <algorithm>
+ #include <cmath>
+ #include <numbers>
++#include <utility>
+ #include "goo/gmem.h"
+ #include "goo/GooLikely.h"
+ #include "poppler/GfxState.h"
+@@ -3589,14 +3591,18 @@ SplashError Splash::drawImage(SplashImageSource src, SplashICCTransform tf, void
+             if (yp < 0 || yp > INT_MAX - 1) {
+                 return SplashError::BadArg;
+             }
+-            const std::unique_ptr<SplashBitmap> scaledImg = scaleImage(src, srcData, srcMode, nComps, srcAlpha, w, h, scaledWidth, scaledHeight, interpolate, tilingPattern);
++            int cropX, cropY, cropWidth, cropHeight;
++            if (!getVisibleImageRect(x0, y0, scaledWidth, scaledHeight, &cropX, &cropY, &cropWidth, &cropHeight)) {
++                return SplashError::NoError;
++            }
++            const std::unique_ptr<SplashBitmap> scaledImg = scaleImage(src, srcData, srcMode, nComps, srcAlpha, w, h, scaledWidth, scaledHeight, cropX, cropY, cropWidth, cropHeight, interpolate, tilingPattern);
+             if (scaledImg == nullptr) {
+                 return SplashError::BadArg;
+             }
+             if (tf != nullptr) {
+                 (*tf)(srcData, scaledImg.get());
+             }
+-            blitImage(*scaledImg, srcAlpha, x0, y0, clipRes);
++            blitImage(*scaledImg, srcAlpha, x0 + cropX, y0 + cropY, clipRes);
+         }
+ 
+         // scaling plus vertical flip
+@@ -3628,15 +3634,21 @@ SplashError Splash::drawImage(SplashImageSource src, SplashICCTransform tf, void
+             if (yp < 0 || yp > INT_MAX - 1) {
+                 return SplashError::BadArg;
+             }
+-            const std::unique_ptr<SplashBitmap> scaledImg = scaleImage(src, srcData, srcMode, nComps, srcAlpha, w, h, scaledWidth, scaledHeight, interpolate, tilingPattern);
++            int cropX, cropY, cropWidth, cropHeight;
++            if (!getVisibleImageRect(x0, y0, scaledWidth, scaledHeight, &cropX, &cropY, &cropWidth, &cropHeight)) {
++                return SplashError::NoError;
++            }
++            // the image gets flipped after scaling, so crop the mirrored rows
++            const int flippedCropY = scaledHeight - cropY - cropHeight;
++            const std::unique_ptr<SplashBitmap> scaledImg = scaleImage(src, srcData, srcMode, nComps, srcAlpha, w, h, scaledWidth, scaledHeight, cropX, flippedCropY, cropWidth, cropHeight, interpolate, tilingPattern);
+             if (scaledImg == nullptr) {
+                 return SplashError::BadArg;
+             }
+             if (tf != nullptr) {
+                 (*tf)(srcData, scaledImg.get());
+             }
+-            vertFlipImage(scaledImg.get(), scaledWidth, scaledHeight, nComps);
+-            blitImage(*scaledImg, srcAlpha, x0, y0, clipRes);
++            vertFlipImage(scaledImg.get(), cropWidth, cropHeight, nComps);
++            blitImage(*scaledImg, srcAlpha, x0 + cropX, y0 + cropY, clipRes);
+         }
+ 
+         // all other cases
+@@ -3791,7 +3803,7 @@ SplashError Splash::arbitraryTransformImage(SplashImageSource src, SplashICCTran
+     if (yp < 0 || yp > INT_MAX - 1) {
+         return SplashError::BadArg;
+     }
+-    const std::unique_ptr<SplashBitmap> scaledImg = scaleImage(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, interpolate);
++    const std::unique_ptr<SplashBitmap> scaledImg = scaleImage(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, 0, 0, scaledWidth, scaledHeight, interpolate);
+ 
+     if (scaledImg == nullptr) {
+         return SplashError::BadArg;
+@@ -3978,26 +3990,57 @@ static bool isImageInterpolationRequired(int srcWidth, int srcHeight, int scaled
+     return true;
+ }
+ 
++bool Splash::getVisibleImageRect(int xDest, int yDest, int scaledWidth, int scaledHeight, int *cropX, int *cropY, int *cropWidth, int *cropHeight) const
++{
++    int clipXMin, clipYMin, clipXMax, clipYMax;
++    state->clip->getBBoxI(&clipXMin, &clipYMin, &clipXMax, &clipYMax);
++    // with anti-aliasing, pixels just outside the integer clip rectangle
++    // can still get partial coverage (see SplashClip::clipAALine), so be
++    // generous; the result is clipped exactly when blitting anyway
++    clipXMin = std::max(clipXMin - 1, 0);
++    clipYMin = std::max(clipYMin - 1, 0);
++    clipXMax = std::min(clipXMax + 1, bitmap->getWidth() - 1);
++    clipYMax = std::min(clipYMax + 1, bitmap->getHeight() - 1);
++
++    // work in 64 bit to avoid overflows with huge images
++    const long long x0 = std::max(static_cast<long long>(xDest), static_cast<long long>(clipXMin));
++    const long long y0 = std::max(static_cast<long long>(yDest), static_cast<long long>(clipYMin));
++    const long long x1 = std::min(static_cast<long long>(xDest) + scaledWidth - 1, static_cast<long long>(clipXMax));
++    const long long y1 = std::min(static_cast<long long>(yDest) + scaledHeight - 1, static_cast<long long>(clipYMax));
++    if (x0 > x1 || y0 > y1) {
++        return false;
++    }
++    *cropX = static_cast<int>(x0 - xDest);
++    *cropY = static_cast<int>(y0 - yDest);
++    *cropWidth = static_cast<int>(x1 - x0 + 1);
++    *cropHeight = static_cast<int>(y1 - y0 + 1);
++    return true;
++}
++
+ // Scale an image into a SplashBitmap.
+-std::unique_ptr<SplashBitmap> Splash::scaleImage(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, bool interpolate, bool tilingPattern)
++std::unique_ptr<SplashBitmap> Splash::scaleImage(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, int cropWidth,
++                                                 int cropHeight, bool interpolate, bool tilingPattern)
+ {
+-    std::unique_ptr<SplashBitmap> dest = std::make_unique<SplashBitmap>(scaledWidth, scaledHeight, 1, srcMode, srcAlpha, true, bitmap->getSeparationList());
++    if (cropX < 0 || cropY < 0 || cropWidth < 1 || cropHeight < 1 || cropX > scaledWidth - cropWidth || cropY > scaledHeight - cropHeight) {
++        return {};
++    }
++    std::unique_ptr<SplashBitmap> dest = std::make_unique<SplashBitmap>(cropWidth, cropHeight, 1, srcMode, srcAlpha, true, bitmap->getSeparationList());
+     if (dest->getDataPtr() != nullptr && srcHeight > 0 && srcWidth > 0) {
+         bool success = true;
+         if (scaledHeight < srcHeight) {
+             if (scaledWidth < srcWidth) {
+-                success = scaleImageYdownXdown(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, dest.get());
++                success = scaleImageYdownXdown(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, cropX, cropY, dest.get());
+             } else {
+-                success = scaleImageYdownXup(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, dest.get());
++                success = scaleImageYdownXup(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, cropX, cropY, dest.get());
+             }
+         } else {
+             if (scaledWidth < srcWidth) {
+-                success = scaleImageYupXdown(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, dest.get());
++                success = scaleImageYupXdown(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, cropX, cropY, dest.get());
+             } else {
+                 if (!tilingPattern && isImageInterpolationRequired(srcWidth, srcHeight, scaledWidth, scaledHeight, interpolate)) {
+-                    success = scaleImageYupXupBilinear(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, dest.get());
++                    success = scaleImageYupXupBilinear(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, cropX, cropY, dest.get());
+                 } else {
+-                    success = scaleImageYupXup(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, dest.get());
++                    success = scaleImageYupXup(src, srcData, srcMode, nComps, srcAlpha, srcWidth, srcHeight, scaledWidth, scaledHeight, cropX, cropY, dest.get());
+                 }
+             }
+         }
+@@ -4010,7 +4053,7 @@ std::unique_ptr<SplashBitmap> Splash::scaleImage(SplashImageSource src, void *sr
+     return dest;
+ }
+ 
+-bool Splash::scaleImageYdownXdown(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, SplashBitmap *dest)
++bool Splash::scaleImageYdownXdown(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, SplashBitmap *dest)
+ {
+     unsigned char *lineBuf, *alphaLineBuf;
+     unsigned int *pixBuf, *alphaPixBuf;
+@@ -4061,12 +4104,35 @@ bool Splash::scaleImageYdownXdown(SplashImageSource src, void *srcData, SplashCo
+         alphaPixBuf = nullptr;
+     }
+ 
++    // if only some columns are needed, compute full rows into rowBuf and
++    // copy the needed part to dest
++    const int cropWidth = dest->getWidth();
++    const int cropHeight = dest->getHeight();
++    const bool cropColumns = cropX != 0 || cropWidth != scaledWidth;
++    unsigned char *rowBuf = nullptr;
++    unsigned char *alphaRowBuf = nullptr;
++    if (cropColumns) {
++        rowBuf = static_cast<unsigned char *>(gmallocn_checkoverflow(scaledWidth, nComps));
++        if (srcAlpha) {
++            alphaRowBuf = static_cast<unsigned char *>(gmalloc_checkoverflow(scaledWidth));
++        }
++        if (unlikely(!rowBuf || (srcAlpha && !alphaRowBuf))) {
++            error(errInternal, -1, "Couldn't allocate memory for rowBuf in Splash::scaleImageYdownXdown");
++            gfree(rowBuf);
++            gfree(alphaRowBuf);
++            gfree(alphaPixBuf);
++            gfree(alphaLineBuf);
++            gfree(pixBuf);
++            gfree(lineBuf);
++            return false;
++        }
++    }
++
+     // init y scale Bresenham
+     yt = 0;
+ 
+-    destPtr = dest->data;
+-    destAlphaPtr = dest->alpha;
+-    for (y = 0; y < scaledHeight; ++y) {
++    // rows below the crop rectangle are not needed
++    for (y = 0; y < cropY + cropHeight; ++y) {
+ 
+         // y scale Bresenham
+         if ((yt += yq) >= scaledHeight) {
+@@ -4076,6 +4142,19 @@ bool Splash::scaleImageYdownXdown(SplashImageSource src, void *srcData, SplashCo
+             yStep = yp;
+         }
+ 
++        // rows above the crop rectangle are not needed
++        if (y < cropY) {
++            for (i = 0; i < yStep; ++i) {
++                (*src)(srcData, nullptr, nullptr);
++            }
++            continue;
++        }
++
++        unsigned char *destRow = dest->data + static_cast<size_t>(y - cropY) * dest->getRowSize();
++        unsigned char *destAlphaRow = srcAlpha ? dest->alpha + static_cast<size_t>(y - cropY) * cropWidth : nullptr;
++        destPtr = cropColumns ? rowBuf : destRow;
++        destAlphaPtr = cropColumns ? alphaRowBuf : destAlphaRow;
++
+         // read rows from image
+         memset(pixBuf, 0, srcWidth * nComps * sizeof(int));
+         if (srcAlpha) {
+@@ -4253,8 +4332,17 @@ bool Splash::scaleImageYdownXdown(SplashImageSource src, void *srcData, SplashCo
+                 *destAlphaPtr++ = static_cast<unsigned char>(alpha);
+             }
+         }
++
++        if (cropColumns) {
++            memcpy(destRow, rowBuf + static_cast<size_t>(cropX) * nComps, static_cast<size_t>(cropWidth) * nComps);
++            if (srcAlpha) {
++                memcpy(destAlphaRow, alphaRowBuf + cropX, cropWidth);
++            }
++        }
+     }
+ 
++    gfree(rowBuf);
++    gfree(alphaRowBuf);
+     gfree(alphaPixBuf);
+     gfree(alphaLineBuf);
+     gfree(pixBuf);
+@@ -4263,7 +4351,7 @@ bool Splash::scaleImageYdownXdown(SplashImageSource src, void *srcData, SplashCo
+     return true;
+ }
+ 
+-bool Splash::scaleImageYdownXup(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, SplashBitmap *dest)
++bool Splash::scaleImageYdownXup(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, SplashBitmap *dest)
+ {
+     unsigned char *lineBuf, *alphaLineBuf;
+     unsigned int *pixBuf, *alphaPixBuf;
+@@ -4314,12 +4402,35 @@ bool Splash::scaleImageYdownXup(SplashImageSource src, void *srcData, SplashColo
+         alphaPixBuf = nullptr;
+     }
+ 
++    // if only some columns are needed, compute full rows into rowBuf and
++    // copy the needed part to dest
++    const int cropWidth = dest->getWidth();
++    const int cropHeight = dest->getHeight();
++    const bool cropColumns = cropX != 0 || cropWidth != scaledWidth;
++    unsigned char *rowBuf = nullptr;
++    unsigned char *alphaRowBuf = nullptr;
++    if (cropColumns) {
++        rowBuf = static_cast<unsigned char *>(gmallocn_checkoverflow(scaledWidth, nComps));
++        if (srcAlpha) {
++            alphaRowBuf = static_cast<unsigned char *>(gmalloc_checkoverflow(scaledWidth));
++        }
++        if (unlikely(!rowBuf || (srcAlpha && !alphaRowBuf))) {
++            error(errInternal, -1, "Couldn't allocate memory for rowBuf in Splash::scaleImageYdownXup");
++            gfree(rowBuf);
++            gfree(alphaRowBuf);
++            gfree(alphaPixBuf);
++            gfree(alphaLineBuf);
++            gfree(pixBuf);
++            gfree(lineBuf);
++            return false;
++        }
++    }
++
+     // init y scale Bresenham
+     yt = 0;
+ 
+-    destPtr = dest->data;
+-    destAlphaPtr = dest->alpha;
+-    for (y = 0; y < scaledHeight; ++y) {
++    // rows below the crop rectangle are not needed
++    for (y = 0; y < cropY + cropHeight; ++y) {
+ 
+         // y scale Bresenham
+         if ((yt += yq) >= scaledHeight) {
+@@ -4329,6 +4440,19 @@ bool Splash::scaleImageYdownXup(SplashImageSource src, void *srcData, SplashColo
+             yStep = yp;
+         }
+ 
++        // rows above the crop rectangle are not needed
++        if (y < cropY) {
++            for (i = 0; i < yStep; ++i) {
++                (*src)(srcData, nullptr, nullptr);
++            }
++            continue;
++        }
++
++        unsigned char *destRow = dest->data + static_cast<size_t>(y - cropY) * dest->getRowSize();
++        unsigned char *destAlphaRow = srcAlpha ? dest->alpha + static_cast<size_t>(y - cropY) * cropWidth : nullptr;
++        destPtr = cropColumns ? rowBuf : destRow;
++        destAlphaPtr = cropColumns ? alphaRowBuf : destAlphaRow;
++
+         // read rows from image
+         memset(pixBuf, 0, srcWidth * nComps * sizeof(int));
+         if (srcAlpha) {
+@@ -4423,8 +4547,17 @@ bool Splash::scaleImageYdownXup(SplashImageSource src, void *srcData, SplashColo
+                 }
+             }
+         }
++
++        if (cropColumns) {
++            memcpy(destRow, rowBuf + static_cast<size_t>(cropX) * nComps, static_cast<size_t>(cropWidth) * nComps);
++            if (srcAlpha) {
++                memcpy(destAlphaRow, alphaRowBuf + cropX, cropWidth);
++            }
++        }
+     }
+ 
++    gfree(rowBuf);
++    gfree(alphaRowBuf);
+     gfree(alphaPixBuf);
+     gfree(alphaLineBuf);
+     gfree(pixBuf);
+@@ -4433,7 +4566,7 @@ bool Splash::scaleImageYdownXup(SplashImageSource src, void *srcData, SplashColo
+     return true;
+ }
+ 
+-bool Splash::scaleImageYupXdown(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, SplashBitmap *dest)
++bool Splash::scaleImageYupXdown(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, SplashBitmap *dest)
+ {
+     unsigned char *lineBuf, *alphaLineBuf;
+     unsigned int pix[splashMaxColorComps];
+@@ -4467,12 +4600,30 @@ bool Splash::scaleImageYupXdown(SplashImageSource src, void *srcData, SplashColo
+         alphaLineBuf = nullptr;
+     }
+ 
++    // each source row produces up to yp + 1 full scaled rows, which are
++    // computed into blockBuf; the part inside the crop rectangle is copied
++    // to dest
++    const int cropWidth = dest->getWidth();
++    const int cropHeight = dest->getHeight();
++    auto *blockBuf = static_cast<unsigned char *>(gmallocn3(yp + 1, scaledWidth, nComps, true));
++    unsigned char *alphaBlockBuf = srcAlpha ? static_cast<unsigned char *>(gmallocn_checkoverflow(yp + 1, scaledWidth)) : nullptr;
++    if (unlikely(!blockBuf || (srcAlpha && !alphaBlockBuf))) {
++        error(errInternal, -1, "Couldn't allocate memory for blockBuf in Splash::scaleImageYupXdown");
++        gfree(blockBuf);
++        gfree(alphaBlockBuf);
++        gfree(alphaLineBuf);
++        gfree(lineBuf);
++        return false;
++    }
++
+     // init y scale Bresenham
+     yt = 0;
+ 
+-    destPtr0 = dest->data;
+-    destAlphaPtr0 = dest->alpha;
+-    for (y = 0; y < srcHeight; ++y) {
++    destPtr0 = blockBuf;
++    destAlphaPtr0 = alphaBlockBuf;
++    // first scaled row produced by the current source row
++    int yDest = 0;
++    for (y = 0; y < srcHeight && yDest < cropY + cropHeight; ++y) {
+ 
+         // y scale Bresenham
+         if ((yt += yq) >= srcHeight) {
+@@ -4482,6 +4633,13 @@ bool Splash::scaleImageYupXdown(SplashImageSource src, void *srcData, SplashColo
+             yStep = yp;
+         }
+ 
++        // skip rows above the crop rectangle
++        if (yDest + yStep <= cropY) {
++            (*src)(srcData, nullptr, nullptr);
++            yDest += yStep;
++            continue;
++        }
++
+         // read row from image
+         (*src)(srcData, lineBuf, alphaLineBuf);
+ 
+@@ -4586,19 +4744,25 @@ bool Splash::scaleImageYupXdown(SplashImageSource src, void *srcData, SplashColo
+             }
+         }
+ 
+-        destPtr0 += yStep * scaledWidth * nComps;
+-        if (srcAlpha) {
+-            destAlphaPtr0 += yStep * scaledWidth;
++        // copy the rows inside the crop rectangle
++        for (i = std::max(0, cropY - yDest); i < yStep && yDest + i < cropY + cropHeight; ++i) {
++            memcpy(dest->data + static_cast<size_t>(yDest + i - cropY) * dest->getRowSize(), blockBuf + (static_cast<size_t>(i) * scaledWidth + cropX) * nComps, static_cast<size_t>(cropWidth) * nComps);
++            if (srcAlpha) {
++                memcpy(dest->alpha + static_cast<size_t>(yDest + i - cropY) * cropWidth, alphaBlockBuf + static_cast<size_t>(i) * scaledWidth + cropX, cropWidth);
++            }
+         }
++        yDest += yStep;
+     }
+ 
++    gfree(blockBuf);
++    gfree(alphaBlockBuf);
+     gfree(alphaLineBuf);
+     gfree(lineBuf);
+ 
+     return true;
+ }
+ 
+-bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, SplashBitmap *dest)
++bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, SplashBitmap *dest)
+ {
+     unsigned char *lineBuf, *alphaLineBuf;
+     unsigned int pix[splashMaxColorComps];
+@@ -4633,12 +4797,17 @@ bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorM
+         alphaLineBuf = nullptr;
+     }
+ 
++    const int cropWidth = dest->getWidth();
++    const int cropHeight = dest->getHeight();
++
+     // init y scale Bresenham
+     yt = 0;
+ 
+     destPtr0 = dest->data;
+     destAlphaPtr0 = dest->alpha;
+-    for (y = 0; y < srcHeight; ++y) {
++    // first scaled row produced by the current source row
++    int yDest = 0;
++    for (y = 0; y < srcHeight && yDest < cropY + cropHeight; ++y) {
+ 
+         // y scale Bresenham
+         if ((yt += yq) >= srcHeight) {
+@@ -4648,14 +4817,24 @@ bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorM
+             yStep = yp;
+         }
+ 
++        // the rows of this block that are inside the crop rectangle
++        const int iMin = std::max(0, cropY - yDest);
++        const int iMax = std::min(yStep, cropY + cropHeight - yDest);
++        if (iMin >= iMax) {
++            (*src)(srcData, nullptr, nullptr);
++            yDest += yStep;
++            continue;
++        }
++
+         // read row from image
+         (*src)(srcData, lineBuf, alphaLineBuf);
+ 
++
+         // init x scale Bresenham
+         xt = 0;
+ 
+         xx = 0;
+-        for (x = 0; x < srcWidth; ++x) {
++        for (x = 0; x < srcWidth && xx < cropX + cropWidth; ++x) {
+ 
+             // x scale Bresenham
+             if ((xt += xq) >= srcWidth) {
+@@ -4665,6 +4844,14 @@ bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorM
+                 xStep = xp;
+             }
+ 
++            // the columns of this block that are inside the crop rectangle
++            const int jMin = std::max(0, cropX - xx);
++            const int jMax = std::min(xStep, cropX + cropWidth - xx);
++            if (jMin >= jMax) {
++                xx += xStep;
++                continue;
++            }
++
+             // compute the final pixel
+             for (i = 0; i < nComps; ++i) {
+                 pix[i] = lineBuf[x * nComps + i];
+@@ -4675,17 +4862,17 @@ bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorM
+             case splashModeMono1: // mono1 is not allowed
+                 break;
+             case splashModeMono8:
+-                for (i = 0; i < yStep; ++i) {
+-                    for (j = 0; j < xStep; ++j) {
+-                        destPtr = destPtr0 + (i * scaledWidth + xx + j) * nComps;
++                for (i = iMin; i < iMax; ++i) {
++                    for (j = jMin; j < jMax; ++j) {
++                        destPtr = destPtr0 + (static_cast<ptrdiff_t>(yDest + i - cropY) * cropWidth + xx + j - cropX) * nComps;
+                         *destPtr++ = static_cast<unsigned char>(pix[0]);
+                     }
+                 }
+                 break;
+             case splashModeRGB8:
+-                for (i = 0; i < yStep; ++i) {
+-                    for (j = 0; j < xStep; ++j) {
+-                        destPtr = destPtr0 + (i * scaledWidth + xx + j) * nComps;
++                for (i = iMin; i < iMax; ++i) {
++                    for (j = jMin; j < jMax; ++j) {
++                        destPtr = destPtr0 + (static_cast<ptrdiff_t>(yDest + i - cropY) * cropWidth + xx + j - cropX) * nComps;
+                         *destPtr++ = static_cast<unsigned char>(pix[0]);
+                         *destPtr++ = static_cast<unsigned char>(pix[1]);
+                         *destPtr++ = static_cast<unsigned char>(pix[2]);
+@@ -4693,9 +4880,9 @@ bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorM
+                 }
+                 break;
+             case splashModeXBGR8:
+-                for (i = 0; i < yStep; ++i) {
+-                    for (j = 0; j < xStep; ++j) {
+-                        destPtr = destPtr0 + (i * scaledWidth + xx + j) * nComps;
++                for (i = iMin; i < iMax; ++i) {
++                    for (j = jMin; j < jMax; ++j) {
++                        destPtr = destPtr0 + (static_cast<ptrdiff_t>(yDest + i - cropY) * cropWidth + xx + j - cropX) * nComps;
+                         *destPtr++ = static_cast<unsigned char>(pix[2]);
+                         *destPtr++ = static_cast<unsigned char>(pix[1]);
+                         *destPtr++ = static_cast<unsigned char>(pix[0]);
+@@ -4704,9 +4891,9 @@ bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorM
+                 }
+                 break;
+             case splashModeBGR8:
+-                for (i = 0; i < yStep; ++i) {
+-                    for (j = 0; j < xStep; ++j) {
+-                        destPtr = destPtr0 + (i * scaledWidth + xx + j) * nComps;
++                for (i = iMin; i < iMax; ++i) {
++                    for (j = jMin; j < jMax; ++j) {
++                        destPtr = destPtr0 + (static_cast<ptrdiff_t>(yDest + i - cropY) * cropWidth + xx + j - cropX) * nComps;
+                         *destPtr++ = static_cast<unsigned char>(pix[2]);
+                         *destPtr++ = static_cast<unsigned char>(pix[1]);
+                         *destPtr++ = static_cast<unsigned char>(pix[0]);
+@@ -4714,9 +4901,9 @@ bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorM
+                 }
+                 break;
+             case splashModeCMYK8:
+-                for (i = 0; i < yStep; ++i) {
+-                    for (j = 0; j < xStep; ++j) {
+-                        destPtr = destPtr0 + (i * scaledWidth + xx + j) * nComps;
++                for (i = iMin; i < iMax; ++i) {
++                    for (j = jMin; j < jMax; ++j) {
++                        destPtr = destPtr0 + (static_cast<ptrdiff_t>(yDest + i - cropY) * cropWidth + xx + j - cropX) * nComps;
+                         *destPtr++ = static_cast<unsigned char>(pix[0]);
+                         *destPtr++ = static_cast<unsigned char>(pix[1]);
+                         *destPtr++ = static_cast<unsigned char>(pix[2]);
+@@ -4725,9 +4912,9 @@ bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorM
+                 }
+                 break;
+             case splashModeDeviceN8:
+-                for (i = 0; i < yStep; ++i) {
+-                    for (j = 0; j < xStep; ++j) {
+-                        destPtr = destPtr0 + (i * scaledWidth + xx + j) * nComps;
++                for (i = iMin; i < iMax; ++i) {
++                    for (j = jMin; j < jMax; ++j) {
++                        destPtr = destPtr0 + (static_cast<ptrdiff_t>(yDest + i - cropY) * cropWidth + xx + j - cropX) * nComps;
+                         for (unsigned int cp : pix) {
+                             *destPtr++ = static_cast<unsigned char>(cp);
+                         }
+@@ -4739,9 +4926,9 @@ bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorM
+             // process alpha
+             if (srcAlpha) {
+                 alpha = alphaLineBuf[x];
+-                for (i = 0; i < yStep; ++i) {
+-                    for (j = 0; j < xStep; ++j) {
+-                        destAlphaPtr = destAlphaPtr0 + i * scaledWidth + xx + j;
++                for (i = iMin; i < iMax; ++i) {
++                    for (j = jMin; j < jMax; ++j) {
++                        destAlphaPtr = destAlphaPtr0 + static_cast<ptrdiff_t>(yDest + i - cropY) * cropWidth + xx + j - cropX;
+                         *destAlphaPtr = static_cast<unsigned char>(alpha);
+                     }
+                 }
+@@ -4750,10 +4937,7 @@ bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorM
+             xx += xStep;
+         }
+ 
+-        destPtr0 += yStep * scaledWidth * nComps;
+-        if (srcAlpha) {
+-            destAlphaPtr0 += yStep * scaledWidth;
+-        }
++        yDest += yStep;
+     }
+ 
+     gfree(alphaLineBuf);
+@@ -4762,14 +4946,11 @@ bool Splash::scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorM
+     return true;
+ }
+ 
+-// expand source row to scaledWidth using linear interpolation
+-static void expandRow(unsigned char *srcBuf, unsigned char *dstBuf, int srcWidth, int scaledWidth, int nComps)
++// expand source row to the requested part of the scaled row using linear
++// interpolation; xInt and xFrac hold the source position of each destination
++// pixel
++static void expandRow(unsigned char *srcBuf, unsigned char *dstBuf, int srcWidth, int dstWidth, int nComps, const int *xInt, const double *xFrac)
+ {
+-    double xStep = static_cast<double>(srcWidth) / scaledWidth;
+-    double xSrc = 0.0;
+-    double xFrac, xInt;
+-    int p;
+-
+     // pad the source with an extra pixel equal to the last pixel
+     // so that when xStep is inside the last pixel we still have two
+     // pixels to interpolate between.
+@@ -4777,128 +4958,162 @@ static void expandRow(unsigned char *srcBuf, unsigned char *dstBuf, int srcWidth
+         srcBuf[srcWidth * nComps + i] = srcBuf[(srcWidth - 1) * nComps + i];
+     }
+ 
+-    for (int x = 0; x < scaledWidth; x++) {
+-        xFrac = modf(xSrc, &xInt);
+-        p = static_cast<int>(xInt);
++    for (int x = 0; x < dstWidth; x++) {
++        const int p = xInt[x];
++        const double frac = xFrac[x];
+         for (int c = 0; c < nComps; c++) {
+-            dstBuf[nComps * x + c] = static_cast<unsigned char>(srcBuf[nComps * p + c] * (1.0 - xFrac) + srcBuf[nComps * (p + 1) + c] * xFrac);
++            dstBuf[nComps * x + c] = static_cast<unsigned char>(srcBuf[nComps * p + c] * (1.0 - frac) + srcBuf[nComps * (p + 1) + c] * frac);
+         }
+-        xSrc += xStep;
+     }
+ }
+ 
+ // Scale up image using bilinear interpolation
+-bool Splash::scaleImageYupXupBilinear(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, SplashBitmap *dest)
++bool Splash::scaleImageYupXupBilinear(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, SplashBitmap *dest)
+ {
+-    unsigned char *srcBuf, *lineBuf1, *lineBuf2, *alphaSrcBuf, *alphaLineBuf1, *alphaLineBuf2;
+     unsigned int pix[splashMaxColorComps];
+-    unsigned char *destPtr0, *destPtr, *destAlphaPtr0, *destAlphaPtr;
++    unsigned char *destPtr;
+     int i;
+ 
+     if (srcWidth < 1 || srcHeight < 1) {
+         return false;
+     }
+ 
+-    // allocate buffers
+-    srcBuf = static_cast<unsigned char *>(gmallocn_checkoverflow(srcWidth + 1, nComps)); // + 1 pixel of padding
+-    if (unlikely(!srcBuf)) {
+-        error(errInternal, -1, "Couldn't allocate memory for srcBuf in Splash::scaleImageYupXupBilinear");
+-        return false;
+-    }
+-
+-    lineBuf1 = static_cast<unsigned char *>(gmallocn_checkoverflow(scaledWidth, nComps));
+-    if (unlikely(!lineBuf1)) {
+-        error(errInternal, -1, "Couldn't allocate memory for lineBuf1 in Splash::scaleImageYupXupBilinear");
+-        gfree(srcBuf);
+-        return false;
+-    }
++    const int cropWidth = dest->getWidth();
++    const int cropHeight = dest->getHeight();
+ 
+-    lineBuf2 = static_cast<unsigned char *>(gmallocn_checkoverflow(scaledWidth, nComps));
+-    if (unlikely(!lineBuf2)) {
+-        error(errInternal, -1, "Couldn't allocate memory for lineBuf2 in Splash::scaleImageYupXupBilinear");
+-        gfree(srcBuf);
++    // two source rows (+ 1 pixel of padding each) and the two corresponding
++    // expanded rows of the crop rectangle
++    auto *srcBuf1 = static_cast<unsigned char *>(gmallocn_checkoverflow(srcWidth + 1, nComps));
++    auto *srcBuf2 = static_cast<unsigned char *>(gmallocn_checkoverflow(srcWidth + 1, nComps));
++    auto *lineBuf1 = static_cast<unsigned char *>(gmallocn_checkoverflow(cropWidth, nComps));
++    auto *lineBuf2 = static_cast<unsigned char *>(gmallocn_checkoverflow(cropWidth, nComps));
++    unsigned char *alphaSrcBuf1 = nullptr, *alphaSrcBuf2 = nullptr, *alphaLineBuf1 = nullptr, *alphaLineBuf2 = nullptr;
++    if (srcAlpha) {
++        alphaSrcBuf1 = static_cast<unsigned char *>(gmalloc_checkoverflow(srcWidth + 1));
++        alphaSrcBuf2 = static_cast<unsigned char *>(gmalloc_checkoverflow(srcWidth + 1));
++        alphaLineBuf1 = static_cast<unsigned char *>(gmalloc_checkoverflow(cropWidth));
++        alphaLineBuf2 = static_cast<unsigned char *>(gmalloc_checkoverflow(cropWidth));
++    }
++    auto *xInt = static_cast<int *>(gmallocn_checkoverflow(cropWidth, sizeof(int)));
++    auto *xFrac = static_cast<double *>(gmallocn_checkoverflow(cropWidth, sizeof(double)));
++    auto freeBuffers = [&] {
++        gfree(srcBuf1);
++        gfree(srcBuf2);
+         gfree(lineBuf1);
++        gfree(lineBuf2);
++        gfree(alphaSrcBuf1);
++        gfree(alphaSrcBuf2);
++        gfree(alphaLineBuf1);
++        gfree(alphaLineBuf2);
++        gfree(xInt);
++        gfree(xFrac);
++    };
++    if (unlikely(!srcBuf1 || !srcBuf2 || !lineBuf1 || !lineBuf2 || !xInt || !xFrac || (srcAlpha && (!alphaSrcBuf1 || !alphaSrcBuf2 || !alphaLineBuf1 || !alphaLineBuf2)))) {
++        error(errInternal, -1, "Couldn't allocate memory in Splash::scaleImageYupXupBilinear");
++        freeBuffers();
+         return false;
+     }
+ 
+-    if (srcAlpha) {
+-        alphaSrcBuf = static_cast<unsigned char *>(gmalloc_checkoverflow(srcWidth + 1)); // + 1 pixel of padding
+-        if (unlikely(!alphaSrcBuf)) {
+-            error(errInternal, -1, "Couldn't allocate memory for alphaSrcBuf in Splash::scaleImageYupXupBilinear");
+-            gfree(srcBuf);
+-            gfree(lineBuf1);
+-            gfree(lineBuf2);
+-            return false;
+-        }
+-
+-        alphaLineBuf1 = static_cast<unsigned char *>(gmalloc_checkoverflow(scaledWidth));
+-        if (unlikely(!alphaLineBuf1)) {
+-            error(errInternal, -1, "Couldn't allocate memory for alphaLineBuf1 in Splash::scaleImageYupXupBilinear");
+-            gfree(srcBuf);
+-            gfree(lineBuf1);
+-            gfree(lineBuf2);
+-            gfree(alphaSrcBuf);
+-            return false;
++    // compute the source position of each destination column; accumulate
++    // the same way as when computing the whole row, to get identical results
++    {
++        double xStep = static_cast<double>(srcWidth) / scaledWidth;
++        double xSrc = 0.0;
++        double xIntD;
++        for (int x = 0; x < cropX + cropWidth; x++) {
++            if (x >= cropX) {
++                xFrac[x - cropX] = modf(xSrc, &xIntD);
++                xInt[x - cropX] = static_cast<int>(xIntD);
++            }
++            xSrc += xStep;
+         }
++    }
+ 
+-        alphaLineBuf2 = static_cast<unsigned char *>(gmalloc_checkoverflow(scaledWidth));
+-        if (unlikely(!alphaLineBuf2)) {
+-            error(errInternal, -1, "Couldn't allocate memory for alphaLineBuf2 in Splash::scaleImageYupXupBilinear");
+-            gfree(srcBuf);
+-            gfree(lineBuf1);
+-            gfree(lineBuf2);
+-            gfree(alphaSrcBuf);
+-            gfree(alphaLineBuf1);
+-            return false;
++    auto expand = [&](unsigned char *srcBuf, unsigned char *lineBuf, unsigned char *alphaSrcBuf, unsigned char *alphaLineBuf) {
++        expandRow(srcBuf, lineBuf, srcWidth, cropWidth, nComps, xInt, xFrac);
++        if (srcAlpha) {
++            expandRow(alphaSrcBuf, alphaLineBuf, srcWidth, cropWidth, 1, xInt, xFrac);
+         }
+-    } else {
+-        alphaSrcBuf = nullptr;
+-        alphaLineBuf1 = nullptr;
+-        alphaLineBuf2 = nullptr;
+-    }
++    };
+ 
+     double ySrc = 0.0;
+     double yStep = static_cast<double>(srcHeight) / scaledHeight;
+     double yFrac, yInt;
+-    int currentSrcRow = -1;
+-    (*src)(srcData, srcBuf, alphaSrcBuf);
+-    expandRow(srcBuf, lineBuf2, srcWidth, scaledWidth, nComps);
+-    if (srcAlpha) {
+-        expandRow(alphaSrcBuf, alphaLineBuf2, srcWidth, scaledWidth, 1);
++
++    // source rows before the first one used by the crop rectangle are not
++    // needed; accumulate the same way as below, to get identical results
++    int firstNeededSrcRow;
++    {
++        double ySrcAtCrop = 0.0;
++        for (int y = 0; y < cropY; y++) {
++            ySrcAtCrop += yStep;
++        }
++        modf(ySrcAtCrop, &yInt);
++        firstNeededSrcRow = static_cast<int>(yInt);
+     }
++    int nextSrcRow = 0;
++    auto readRow = [&](unsigned char *buf, unsigned char *alphaBuf) {
++        if (nextSrcRow < firstNeededSrcRow) {
++            (*src)(srcData, nullptr, nullptr);
++        } else {
++            (*src)(srcData, buf, alphaBuf);
++        }
++        nextSrcRow++;
++    };
+ 
+-    destPtr0 = dest->data;
+-    destAlphaPtr0 = dest->alpha;
+-    for (int y = 0; y < scaledHeight; y++) {
++    int currentSrcRow = -1;
++    // whether lineBuf1 and lineBuf2 hold the expanded srcBuf1 and srcBuf2;
++    // rows above the crop rectangle don't need to be expanded
++    bool linesExpanded = false;
++    readRow(srcBuf2, alphaSrcBuf2);
++
++    for (int y = 0; y < cropY + cropHeight; y++) {
+         yFrac = modf(ySrc, &yInt);
+         if (static_cast<int>(yInt) > currentSrcRow) {
+             currentSrcRow++;
+-            // Copy line2 data to line1 and get next line2 data.
+-            // If line2 already contains the last source row we don't touch it.
++            // Move row 2 to row 1 and get the next row 2.
++            // If row 2 already contains the last source row we keep it.
+             // This effectively adds an extra row of padding for interpolating the
+             // last source row with.
+-            memcpy(lineBuf1, lineBuf2, scaledWidth * nComps);
+-            if (srcAlpha) {
+-                memcpy(alphaLineBuf1, alphaLineBuf2, scaledWidth);
+-            }
++            std::swap(srcBuf1, srcBuf2);
++            std::swap(alphaSrcBuf1, alphaSrcBuf2);
+             if (currentSrcRow < srcHeight - 1) {
+-                (*src)(srcData, srcBuf, alphaSrcBuf);
+-                expandRow(srcBuf, lineBuf2, srcWidth, scaledWidth, nComps);
++                readRow(srcBuf2, alphaSrcBuf2);
++            } else {
++                memcpy(srcBuf2, srcBuf1, static_cast<size_t>(srcWidth) * nComps);
+                 if (srcAlpha) {
+-                    expandRow(alphaSrcBuf, alphaLineBuf2, srcWidth, scaledWidth, 1);
++                    memcpy(alphaSrcBuf2, alphaSrcBuf1, srcWidth);
+                 }
+             }
++            if (linesExpanded) {
++                std::swap(lineBuf1, lineBuf2);
++                std::swap(alphaLineBuf1, alphaLineBuf2);
++                expand(srcBuf2, lineBuf2, alphaSrcBuf2, alphaLineBuf2);
++            }
++        }
++
++        if (y < cropY) {
++            ySrc += yStep;
++            continue;
++        }
++
++        if (!linesExpanded) {
++            expand(srcBuf1, lineBuf1, alphaSrcBuf1, alphaLineBuf1);
++            expand(srcBuf2, lineBuf2, alphaSrcBuf2, alphaLineBuf2);
++            linesExpanded = true;
+         }
+ 
+         // write row y using linear interpolation on lineBuf1 and lineBuf2
+-        for (int x = 0; x < scaledWidth; ++x) {
++        unsigned char *destRow = dest->data + static_cast<size_t>(y - cropY) * dest->getRowSize();
++        unsigned char *destAlphaRow = srcAlpha ? dest->alpha + static_cast<size_t>(y - cropY) * cropWidth : nullptr;
++        for (int x = 0; x < cropWidth; ++x) {
+             // compute the final pixel
+             for (i = 0; i < nComps; ++i) {
+                 pix[i] = static_cast<unsigned char>(lineBuf1[x * nComps + i] * (1.0 - yFrac) + lineBuf2[x * nComps + i] * yFrac);
+             }
+ 
+             // store the pixel
+-            destPtr = destPtr0 + (y * scaledWidth + x) * nComps;
++            destPtr = destRow + static_cast<size_t>(x) * nComps;
+             switch (srcMode) {
+             case splashModeMono1: // mono1 is not allowed
+                 break;
+@@ -4936,20 +5151,14 @@ bool Splash::scaleImageYupXupBilinear(SplashImageSource src, void *srcData, Spla
+ 
+             // process alpha
+             if (srcAlpha) {
+-                destAlphaPtr = destAlphaPtr0 + y * scaledWidth + x;
+-                *destAlphaPtr = static_cast<unsigned char>(alphaLineBuf1[x] * (1.0 - yFrac) + alphaLineBuf2[x] * yFrac);
++                destAlphaRow[x] = static_cast<unsigned char>(alphaLineBuf1[x] * (1.0 - yFrac) + alphaLineBuf2[x] * yFrac);
+             }
+         }
+ 
+         ySrc += yStep;
+     }
+ 
+-    gfree(alphaSrcBuf);
+-    gfree(alphaLineBuf1);
+-    gfree(alphaLineBuf2);
+-    gfree(srcBuf);
+-    gfree(lineBuf1);
+-    gfree(lineBuf2);
++    freeBuffers();
+ 
+     return true;
+ }
+diff --git a/splash/Splash.h b/splash/Splash.h
+index f03b164..c09f520 100644
+--- a/splash/Splash.h
++++ b/splash/Splash.h
+@@ -52,7 +52,8 @@ using SplashImageMaskSource = bool (*)(void *data, SplashColorPtr pixel);
+ 
+ // Retrieves the next line of pixels in an image.  Normally, fills in
+ // *<line> and returns true.  If the image stream is exhausted,
+-// returns false.
++// returns false.  If <colorLine> is nullptr, the line is not needed and
++// should just be skipped.
+ using SplashImageSource = bool (*)(void *data, SplashColorPtr colorLine, unsigned char *alphaLine);
+ 
+ // Use ICCColorSpace to transform a bitmap
+@@ -301,13 +302,23 @@ private:
+     void blitMask(const SplashBitmap &src, int xDest, int yDest, SplashClipResult clipRes);
+     SplashError arbitraryTransformImage(SplashImageSource src, SplashICCTransform tf, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, const std::array<double, 6> &mat, bool interpolate,
+                                         bool tilingPattern = false);
+-    std::unique_ptr<SplashBitmap> scaleImage(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, bool interpolate,
+-                                             bool tilingPattern = false);
+-    static bool scaleImageYdownXdown(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, SplashBitmap *dest);
+-    static bool scaleImageYdownXup(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, SplashBitmap *dest);
+-    static bool scaleImageYupXdown(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, SplashBitmap *dest);
+-    static bool scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, SplashBitmap *dest);
+-    static bool scaleImageYupXupBilinear(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, SplashBitmap *dest);
++    // Scales the image to <scaledWidth> x <scaledHeight>, but only produces the
++    // <cropWidth> x <cropHeight> sub-rectangle at (<cropX>, <cropY>) of the
++    // scaled image. The result is identical to scaling the whole image and
++    // cutting out the sub-rectangle afterwards.
++    std::unique_ptr<SplashBitmap> scaleImage(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, int cropWidth,
++                                             int cropHeight, bool interpolate, bool tilingPattern = false);
++    // The scaleImage* functions fill <dest>, which holds the sub-rectangle of
++    // the scaled image starting at (<cropX>, <cropY>).
++    static bool scaleImageYdownXdown(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, SplashBitmap *dest);
++    static bool scaleImageYdownXup(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, SplashBitmap *dest);
++    static bool scaleImageYupXdown(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, SplashBitmap *dest);
++    static bool scaleImageYupXup(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, SplashBitmap *dest);
++    static bool scaleImageYupXupBilinear(SplashImageSource src, void *srcData, SplashColorMode srcMode, int nComps, bool srcAlpha, int srcWidth, int srcHeight, int scaledWidth, int scaledHeight, int cropX, int cropY, SplashBitmap *dest);
++    // Computes the part of the scaled image, placed at <xDest>, <yDest> on
++    // the bitmap, that can be visible given the current clip.  Returns
++    // false if nothing can be visible.
++    bool getVisibleImageRect(int xDest, int yDest, int scaledWidth, int scaledHeight, int *cropX, int *cropY, int *cropWidth, int *cropHeight) const;
+     static void vertFlipImage(SplashBitmap *img, int width, int height, int nComps);
+     void blitImage(const SplashBitmap &src, bool srcAlpha, int xDest, int yDest, SplashClipResult clipRes);
+     void blitImageClipped(const SplashBitmap &src, bool srcAlpha, int xSrc, int ySrc, int xDest, int yDest, int w, int h);
+diff --git a/splash/SplashClip.cc b/splash/SplashClip.cc
+index 7824965..e525808 100644
+--- a/splash/SplashClip.cc
++++ b/splash/SplashClip.cc
+@@ -346,6 +346,37 @@ void SplashClip::clipAALine(SplashBitmap *aaBuf, int *x0, int *x1, int y, bool a
+     }
+ }
+ 
++void SplashClip::getBBoxI(int *xMinA, int *yMinA, int *xMaxA, int *yMaxA) const
++{
++    *xMinA = xMinI;
++    *yMinA = yMinI;
++    *xMaxA = xMaxI;
++    *yMaxA = yMaxI;
++    for (const auto &scanner : scanners) {
++        int sxMin, syMin, sxMax, syMax;
++        scanner->getBBox(&sxMin, &syMin, &sxMax, &syMax);
++        if (sxMin > sxMax || syMin > syMax) {
++            // empty path
++            *xMaxA = *xMinA - 1;
++            *yMaxA = *yMinA - 1;
++            return;
++        }
++        if (antialias) {
++            // round outwards
++            sxMin = splashFloor(static_cast<double>(sxMin) / splashAASize);
++            syMin = splashFloor(static_cast<double>(syMin) / splashAASize);
++            sxMax = splashFloor(static_cast<double>(sxMax) / splashAASize);
++            syMax = splashFloor(static_cast<double>(syMax) / splashAASize);
++        }
++        // the scanner bbox is computed from the path segments, so be generous
++        // about pixels touched by the path boundary
++        *xMinA = std::max(*xMinA, sxMin - 1);
++        *yMinA = std::max(*yMinA, syMin - 1);
++        *xMaxA = std::min(*xMaxA, sxMax + 1);
++        *yMaxA = std::min(*yMaxA, syMax + 1);
++    }
++}
++
+ bool SplashClip::testClipPaths(int x, int y) const
+ {
+     if (antialias) {
+diff --git a/splash/SplashClip.h b/splash/SplashClip.h
+index 4b269c8..1b5f76d 100644
+--- a/splash/SplashClip.h
++++ b/splash/SplashClip.h
+@@ -117,6 +117,11 @@ public:
+     int getYMinI() const { return yMinI; }
+     int getYMaxI() const { return yMaxI; }
+ 
++    // Get a bounding box, in integer coordinates, of the pixels that can be
++    // inside the clip region, taking the arbitrary paths into account.
++    // The box may be larger than necessary, but never smaller.
++    void getBBoxI(int *xMinA, int *yMinA, int *xMaxA, int *yMaxA) const;
++
+     // Get the number of arbitrary paths used by the clip region.
+     int getNumPaths() { return scanners.size(); }
+ 
+-- 
+2.43.0
+
+
+From e1822096abc7d8960a762dd7f260a2a04a0a9a39 Mon Sep 17 00:00:00 2001
+From: Heinz Wiesinger <heinz.accounts+anthropic@wiesinger.pro>
+Date: Wed, 21 Oct 2026 21:06:26 +0000
+Subject: [PATCH 2/3] SplashOutputDev: Cache colour conversion results in
+ iccTransform
+
+Converting a pixel through an ICC transform is expensive (lcms evaluates
+the tone curves in floating point for every pixel, as the transforms are
+created with cmsFLAGS_NOOPTIMIZE), while images usually contain lots of
+pixels of the same colour. lcms only caches the last converted pixel.
+
+Keep a small hash table of already converted colours for 3 component
+images while transforming a scaled image, and only pass the pixels that
+are not in it to GfxImageColorMap::getRGBLine(). The result is identical.
+
+For a page with a large ICC based image this saves 20-40% of the
+rendering time, e.g. 772 ms -> 602 ms at 200 dpi and 512 ms -> 312 ms
+for a 1920x1080 tile at 400 dpi.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014HMJHMHEm38AikxhNxAjhE
+---
+ poppler/SplashOutputDev.cc | 84 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/poppler/SplashOutputDev.cc b/poppler/SplashOutputDev.cc
+index c595027..cbc5ba9 100644
+--- a/poppler/SplashOutputDev.cc
++++ b/poppler/SplashOutputDev.cc
+@@ -2950,11 +2950,91 @@ bool SplashOutputDev::iccImageSrc(void *data, SplashColorPtr colorLine, unsigned
+     return true;
+ }
+ 
++namespace {
++
++// Converting colors through an ICC transform is expensive, while images
++// usually contain lots of pixels with the same color, so cache the results
++// of GfxImageColorMap::getRGBLine for images with 3 components per pixel.
++class RGBLineCache
++{
++public:
++    explicit RGBLineCache(GfxImageColorMap *colorMapA) : colorMap(colorMapA), keys(cacheSize, 0), values(cacheSize * 3) { }
++
++    void getRGBLine(const unsigned char *in, unsigned char *out, int length)
++    {
++        if (static_cast<int>(missPos.size()) < length) {
++            missIn.resize(3 * static_cast<size_t>(length));
++            missOut.resize(3 * static_cast<size_t>(length));
++            missPos.resize(length);
++            missKeys.resize(length);
++        }
++
++        int nMisses = 0;
++        for (int x = 0; x < length; ++x) {
++            const unsigned char *pix = in + 3 * static_cast<size_t>(x);
++            const unsigned int key = keyOf(pix);
++            const unsigned int slot = slotOf(key);
++            if (keys[slot] == key) {
++                memcpy(out + 3 * static_cast<size_t>(x), &values[3 * static_cast<size_t>(slot)], 3);
++            } else {
++                memcpy(&missIn[3 * static_cast<size_t>(nMisses)], pix, 3);
++                missPos[nMisses] = x;
++                missKeys[nMisses] = key;
++                ++nMisses;
++            }
++        }
++        if (nMisses == 0) {
++            return;
++        }
++
++        // convert the pixels that were not in the cache (note that this may
++        // modify missIn)
++        colorMap->getRGBLine(missIn.data(), missOut.data(), nMisses);
++        for (int i = 0; i < nMisses; ++i) {
++            const int x = missPos[i];
++            const unsigned int key = missKeys[i];
++            const unsigned int slot = slotOf(key);
++            keys[slot] = key;
++            memcpy(&values[3 * static_cast<size_t>(slot)], &missOut[3 * static_cast<size_t>(i)], 3);
++            memcpy(out + 3 * static_cast<size_t>(x), &missOut[3 * static_cast<size_t>(i)], 3);
++        }
++    }
++
++private:
++    static constexpr int cacheBits = 16;
++    static constexpr unsigned int cacheSize = 1 << cacheBits;
++
++    // the 24 bit color, plus a bit to tell used from unused cache slots
++    static unsigned int keyOf(const unsigned char *pix) { return 0x1000000 | (pix[0] << 16) | (pix[1] << 8) | pix[2]; }
++    static unsigned int slotOf(unsigned int key) { return (key * 2654435761U) >> (32 - cacheBits); }
++
++    GfxImageColorMap *colorMap;
++    std::vector<unsigned int> keys;
++    std::vector<unsigned char> values;
++    std::vector<unsigned char> missIn, missOut;
++    std::vector<int> missPos;
++    std::vector<unsigned int> missKeys;
++};
++
++}
++
+ void SplashOutputDev::iccTransform(void *data, SplashBitmap *bitmap)
+ {
+     auto *imgData = static_cast<SplashOutImageData *>(data);
+     int nComps = imgData->colorMap->getNumPixelComps();
+ 
++    std::unique_ptr<RGBLineCache> rgbCache;
++    if (nComps == 3 && (imgData->colorMode == splashModeRGB8 || imgData->colorMode == splashModeBGR8 || imgData->colorMode == splashModeXBGR8)) {
++        rgbCache = std::make_unique<RGBLineCache>(imgData->colorMap);
++    }
++    auto getRGBLine = [&](unsigned char *in, unsigned char *out, int length) {
++        if (rgbCache) {
++            rgbCache->getRGBLine(in, out, length);
++        } else {
++            imgData->colorMap->getRGBLine(in, out, length);
++        }
++    };
++
+     auto *colorLine = static_cast<unsigned char *>(gmalloc(nComps * bitmap->getWidth()));
+     unsigned char *rgbxLine = (imgData->colorMode == splashModeXBGR8) ? static_cast<unsigned char *>(gmalloc(3 * bitmap->getWidth())) : nullptr;
+     for (int i = 0; i < bitmap->getHeight(); i++) {
+@@ -2967,7 +3047,7 @@ void SplashOutputDev::iccTransform(void *data, SplashBitmap *bitmap)
+             break;
+         case splashModeRGB8:
+         case splashModeBGR8:
+-            imgData->colorMap->getRGBLine(p, colorLine, bitmap->getWidth());
++            getRGBLine(p, colorLine, bitmap->getWidth());
+             memcpy(p, colorLine, nComps * bitmap->getWidth());
+             break;
+         case splashModeCMYK8:
+@@ -2987,7 +3067,7 @@ void SplashOutputDev::iccTransform(void *data, SplashBitmap *bitmap)
+                 *q++ = b[1];
+                 *q++ = b[0];
+             }
+-            imgData->colorMap->getRGBLine(rgbxLine, colorLine, bitmap->getWidth());
++            getRGBLine(rgbxLine, colorLine, bitmap->getWidth());
+             b = p;
+             for (x = 0, q = colorLine; x < bitmap->getWidth(); ++x, b += 4) {
+                 b[2] = *q++;
+-- 
+2.43.0
+
+
+From 4a96c05dd9da1dd0ed9dfe23a794a5cad9dbf96d Mon Sep 17 00:00:00 2001
+From: Heinz Wiesinger <heinz.accounts+anthropic@wiesinger.pro>
+Date: Wed, 21 Oct 2026 21:06:26 +0000
+Subject: [PATCH 3/3] DCTStream: Feed libjpeg more than one byte at a time
+
+The source manager handed the compressed data to libjpeg one byte per
+fill_input_buffer() call, i.e. with one callback and one virtual
+getChar() call per byte of a possibly multi-megabyte image.
+
+Read up to 4 KB at a time instead. This is not done for inline images,
+since there the data following the image must not be consumed.
+
+This saves about 5-8% when rendering pages dominated by JPEG decoding.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014HMJHMHEm38AikxhNxAjhE
+---
+ poppler/DCTStream.cc | 29 ++++++++++++++++++-----------
+ poppler/DCTStream.h  |  5 ++++-
+ 2 files changed, 22 insertions(+), 12 deletions(-)
+
+diff --git a/poppler/DCTStream.cc b/poppler/DCTStream.cc
+index 397771b..ae2f0d1 100644
+--- a/poppler/DCTStream.cc
++++ b/poppler/DCTStream.cc
+@@ -25,23 +25,28 @@ static void str_init_source(j_decompress_ptr /*cinfo*/) { }
+ 
+ static boolean str_fill_input_buffer(j_decompress_ptr cinfo)
+ {
+-    int c;
+     auto *src = reinterpret_cast<struct str_src_mgr *>(cinfo->src);
++    int n;
+     if (src->index == 0) {
+-        c = 0xFF;
+-        src->index++;
+-    } else if (src->index == 1) {
+-        c = 0xD8;
+-        src->index++;
++        // the start marker was consumed while looking for it in rewind()
++        src->buffer[0] = 0xFF;
++        src->buffer[1] = 0xD8;
++        src->index = 2;
++        n = 2;
++    } else if (src->readAhead) {
++        n = src->str->doGetChars(sizeof(src->buffer), src->buffer);
+     } else {
+-        c = src->str->getChar();
++        const int c = src->str->getChar();
++        src->buffer[0] = static_cast<JOCTET>(c);
++        n = c != EOF ? 1 : 0;
+     }
+-    src->buffer = c;
+-    src->pub.next_input_byte = &src->buffer;
+-    src->pub.bytes_in_buffer = 1;
+-    if (c != EOF) {
++    src->pub.next_input_byte = src->buffer;
++    if (n > 0) {
++        src->pub.bytes_in_buffer = n;
+         return TRUE;
+     }
++    src->buffer[0] = static_cast<JOCTET>(EOF);
++    src->pub.bytes_in_buffer = 1;
+     return FALSE;
+ }
+ 
+@@ -108,6 +113,8 @@ void DCTStream::init()
+     src.pub.next_input_byte = nullptr;
+     src.str = str;
+     src.index = 0;
++    BaseStream *baseStr = str->getBaseStream();
++    src.readAhead = baseStr != nullptr && dynamic_cast<EmbedStream *>(baseStr) == nullptr;
+     current = nullptr;
+     limit = nullptr;
+ 
+diff --git a/poppler/DCTStream.h b/poppler/DCTStream.h
+index b46c351..0a5f0c6 100644
+--- a/poppler/DCTStream.h
++++ b/poppler/DCTStream.h
+@@ -32,9 +32,12 @@ extern "C" {
+ struct str_src_mgr
+ {
+     struct jpeg_source_mgr pub;
+-    JOCTET buffer;
++    JOCTET buffer[4096];
+     Stream *str;
+     int index;
++    // whether we may read ahead of what libjpeg needs; not possible for
++    // inline images, where the data following the image must not be consumed
++    bool readAhead;
+ };
+ 
+ struct str_error_mgr
+-- 
+2.43.0
+
