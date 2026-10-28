@@ -5,13 +5,45 @@
 */
 
 #include "epubdocument.h"
+#include <QAbstractTextDocumentLayout>
 #include <QDir>
+#include <QPainter>
 #include <QTemporaryFile>
 
 #include <QRegularExpression>
 
 Q_LOGGING_CATEGORY(OkularEpuDebug, "org.kde.okular.generators.epu", QtWarningMsg)
 using namespace Epub;
+
+ImageHandler::ImageHandler(QTextObjectInterface *defaultHandler, QObject *parent)
+    : QObject(parent)
+    , mDefaultHandler(defaultHandler)
+{
+}
+
+QSizeF ImageHandler::intrinsicSize(QTextDocument *doc, int posInDocument, const QTextFormat &format)
+{
+    return mDefaultHandler->intrinsicSize(doc, posInDocument, format);
+}
+
+void ImageHandler::drawObject(QPainter *painter, const QRectF &rect, QTextDocument *doc, int posInDocument, const QTextFormat &format)
+{
+    const QImage image = doc->resource(QTextDocument::ImageResource, QUrl(format.toImageFormat().name())).value<QImage>();
+    if (image.isNull() || painter->transform().type() > QTransform::TxScale) {
+        mDefaultHandler->drawObject(painter, rect, doc, posInDocument, format);
+        return;
+    }
+
+    const QRectF targetRect = painter->transform().mapRect(rect);
+    const qreal dpr = painter->device()->devicePixelRatio();
+    QImage scaled = image.scaled((targetRect.size() * dpr).toSize(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    scaled.setDevicePixelRatio(dpr);
+
+    painter->save();
+    painter->resetTransform();
+    painter->drawImage(targetRect.topLeft(), scaled);
+    painter->restore();
+}
 
 EpubDocument::EpubDocument(const QString &fileName, const QFont &font)
     : QTextDocument()
@@ -26,6 +58,9 @@ EpubDocument::EpubDocument(const QString &fileName, const QFont &font)
 
     setPageSize(QSizeF(600, 800));
     setDefaultStyleSheet(QStringLiteral("a { color: %1 }").arg(QColor(Qt::blue).name()));
+
+    QAbstractTextDocumentLayout *layout = documentLayout();
+    layout->registerHandler(QTextFormat::ImageObject, new ImageHandler(layout->handlerForObject(QTextFormat::ImageObject), layout));
 }
 
 bool EpubDocument::isValid()
@@ -117,13 +152,13 @@ QVariant EpubDocument::loadResource(int type, const QUrl &name)
     switch (type) {
     case QTextDocument::ImageResource: {
         QImage img = QImage::fromData(reinterpret_cast<unsigned char *>(data), size);
-        const int maxHeight = maxContentHeight();
-        const int maxWidth = maxContentWidth();
-        if (img.height() > maxHeight) {
-            img = img.scaledToHeight(maxHeight, Qt::SmoothTransformation);
-        }
-        if (img.width() > maxWidth) {
-            img = img.scaledToWidth(maxWidth, Qt::SmoothTransformation);
+        // Make images that are too big fit the page by raising their device pixel ratio
+        // instead of scaling them down. QTextDocument lays them out using their device
+        // independent size, but still paints them from the full resolution data, so they
+        // don't get blurry when zooming in or on HiDPI screens.
+        const qreal ratio = qMax(img.width() / qreal(maxContentWidth()), img.height() / qreal(maxContentHeight()));
+        if (ratio > 1) {
+            img.setDevicePixelRatio(ratio);
         }
         resource.setValue(img);
         break;

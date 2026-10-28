@@ -228,16 +228,20 @@ QTextDocument *Converter::convert(const QString &fileName)
                         int ht = images.at(i).toElement().attribute(QStringLiteral("height")).toInt();
                         int wd = images.at(i).toElement().attribute(QStringLiteral("width")).toInt();
                         QImage img = mTextDocument->loadResource(QTextDocument::ImageResource, QUrl(lnk)).value<QImage>();
+                        const QSizeF imgSize = img.deviceIndependentSize();
                         if (ht == 0) {
-                            ht = img.height();
+                            ht = qRound(imgSize.height());
                         }
                         if (wd == 0) {
-                            wd = img.width();
+                            wd = qRound(imgSize.width());
                         }
+                        // scale down proportionally to keep the aspect ratio
                         if (ht > maxHeight) {
+                            wd = wd * maxHeight / ht;
                             ht = maxHeight;
                         }
                         if (wd > maxWidth) {
+                            ht = ht * maxWidth / wd;
                             wd = maxWidth;
                         }
                         mTextDocument->addResource(QTextDocument::ImageResource, QUrl(lnk), img);

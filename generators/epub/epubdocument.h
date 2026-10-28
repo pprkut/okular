@@ -10,12 +10,30 @@
 #include <QImage>
 #include <QLoggingCategory>
 #include <QTextDocument>
+#include <QTextObjectInterface>
 #include <QUrl>
 #include <QVariant>
 #include <epub.h>
 
 namespace Epub
 {
+// Draws images smoothly scaled to the resolution they are painted at. QPainter alone
+// doesn't filter properly when scaling images down a lot, which makes high resolution
+// images look bad at low zoom levels. Sizing is left to Qt's default image handler.
+class ImageHandler : public QObject, public QTextObjectInterface
+{
+    Q_OBJECT
+    Q_INTERFACES(QTextObjectInterface)
+
+public:
+    ImageHandler(QTextObjectInterface *defaultHandler, QObject *parent);
+    QSizeF intrinsicSize(QTextDocument *doc, int posInDocument, const QTextFormat &format) override;
+    void drawObject(QPainter *painter, const QRectF &rect, QTextDocument *doc, int posInDocument, const QTextFormat &format) override;
+
+private:
+    QTextObjectInterface *mDefaultHandler;
+};
+
 class EpubDocument : public QTextDocument
 {
     Q_OBJECT
